@@ -137,6 +137,15 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
         """
         return "<MacBookPro18,3> <Mac OS X;13.4.1;22F8> <com.apple.AuthKit/1 (com.apple.akd/1.0)>"
 
+    def get_client_info(self, application: str) -> str:
+        """Describe an application using the provider's model and OS prefix."""
+        return f"{self.client.rsplit(' <', 1)[0]} <{application}>"
+
+    @property
+    def user_agent(self) -> str:
+        """User agent describing the provider's networking stack."""
+        return "akd/1.0 CFNetwork/1408.0.4 Darwin/22.5.0"
+
     async def get_headers(
         self,
         user_id: str,
@@ -262,11 +271,23 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
             allow_unverified_https=val.get("allow_unverified_https", False),
         )
 
+    def _get_header(self, name: str) -> str | None:
+        """Case-insensitive lookup in the fetched remote Anisette JSON."""
+        if not self._anisette_data:
+            return None
+        if name in self._anisette_data:
+            return self._anisette_data[name]
+        lower = name.lower()
+        for key, value in self._anisette_data.items():
+            if key.lower() == lower:
+                return value
+        return None
+
     @property
     @override
     def otp(self) -> str:
         """See :meth:`BaseAnisetteProvider.otp`."""
-        otp = (self._anisette_data or {}).get("X-Apple-I-MD")
+        otp = self._get_header("X-Apple-I-MD")
         if otp is None:
             logger.warning("X-Apple-I-MD header not found! Returning fallback...")
         return otp or ""
@@ -275,10 +296,40 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
     @override
     def machine(self) -> str:
         """See :meth:`BaseAnisetteProvider.machine`."""
-        machine = (self._anisette_data or {}).get("X-Apple-I-MD-M")
+        machine = self._get_header("X-Apple-I-MD-M")
         if machine is None:
             logger.warning("X-Apple-I-MD-M header not found! Returning fallback...")
         return machine or ""
+
+    @property
+    @override
+    def router(self) -> str:
+        """Use the routing info returned by the remote server when available."""
+        return self._get_header("X-Apple-I-MD-RINFO") or super().router
+
+    @property
+    @override
+    def client(self) -> str:
+        """Use the client info returned by the remote server when available."""
+        return self._get_header("X-MMe-Client-Info") or super().client
+
+    @property
+    @override
+    def timestamp(self) -> str:
+        """Use the timestamp returned by the remote server when available."""
+        return self._get_header("X-Apple-I-Client-Time") or super().timestamp
+
+    @property
+    @override
+    def timezone(self) -> str:
+        """Use the timezone returned by the remote server when available."""
+        return self._get_header("X-Apple-I-TimeZone") or super().timezone
+
+    @property
+    @override
+    def locale(self) -> str:
+        """Use the locale returned by the remote server when available."""
+        return self._get_header("X-Apple-Locale") or super().locale
 
     @override
     async def get_headers(
@@ -300,7 +351,14 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
             self._anisette_data = r.json()
             self._anisette_data_expires_at = time.time() + self._ANISETTE_DATA_VALID_FOR
 
-        return await super().get_headers(user_id, device_id, serial, with_client_info)
+        headers = await super().get_headers(user_id, device_id, serial, with_client_info)
+        if (local_user := self._get_header("X-Apple-I-MD-LU")) is not None:
+            headers["X-Apple-I-MD-LU"] = local_user
+        if (remote_device_id := self._get_header("X-Mme-Device-Id")) is not None:
+            headers["X-Mme-Device-Id"] = remote_device_id
+        if (remote_serial := self._get_header("X-Apple-I-SRL-NO")) is not None:
+            headers["X-Apple-I-SRL-NO"] = remote_serial
+        return headers
 
     @override
     async def close(self) -> None:

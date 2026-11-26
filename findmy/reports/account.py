@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import json
 import logging
 import plistlib
@@ -64,6 +65,12 @@ logger = logging.getLogger(__name__)
 
 srp.rfc5054_enable()
 srp.no_username_in_x()
+
+
+def _normalize_2fa_status(status: dict[str, Any]) -> None:
+    """Treat Apple's hsc=409 response without `au` as a trusted-device challenge."""
+    if status.get("hsc") == 409 and not status.get("au"):
+        status["au"] = "trustedDeviceSecondaryAuth"
 
 
 class _AccountInfo(TypedDict):
@@ -624,9 +631,14 @@ class AsyncAppleAccount(BaseAppleAccount):
         start_ts = int((now - timedelta(days=7)).timestamp()) * 1000
         end_ts = int(now.timestamp()) * 1000
 
+        tokens = self._login_state_data["mobileme_data"].get("tokens", {})
+        search_party_token = tokens.get("searchPartyToken")
+        if not search_party_token:
+            msg = f"Missing searchPartyToken in mobileme tokens (got: {sorted(tokens.keys())})"
+            raise UnauthorizedError(msg)
         auth = (
             self._login_state_data["dsid"],
-            self._login_state_data["mobileme_data"]["tokens"]["searchPartyToken"],
+            search_party_token,
         )
         data = {
             "clientContext": {
@@ -818,7 +830,10 @@ class AsyncAppleAccount(BaseAppleAccount):
         logger.debug("Verifying response to auth request")
 
         if r["Status"].get("ec") != 0:
-            msg = "Email verification failed: " + r["Status"].get("em")
+            msg = (
+                f"Email verification failed (ec={r['Status'].get('ec')}): "
+                f"{r['Status'].get('em')}"
+            )
             raise InvalidCredentialsError(msg)
         sp = r.get("sp")
         if not isinstance(sp, str) or sp not in {"s2k", "s2k_fo"}:
@@ -835,11 +850,15 @@ class AsyncAppleAccount(BaseAppleAccount):
         r = await self._gsa_request(
             {"c": r["c"], "M1": m1, "u": self._username, "o": "complete"},
         )
+        _normalize_2fa_status(r["Status"])
 
         logger.debug("Verifying password challenge response")
 
         if r["Status"].get("ec") != 0:
-            msg = "Password authentication failed: " + r["Status"].get("em")
+            msg = (
+                f"Password authentication failed (ec={r['Status'].get('ec')}): "
+                f"{r['Status'].get('em')}"
+            )
             raise InvalidCredentialsError(msg)
         usr.verify_session(r.get("M2"))
         if not usr.authenticated():
@@ -900,13 +919,17 @@ class AsyncAppleAccount(BaseAppleAccount):
             },
         )
 
+        ani_headers = await self.get_anisette_headers()
         headers = {
             "X-Apple-ADSID": self._login_state_data["adsid"],
-            "User-Agent": "com.apple.iCloudHelper/282 CFNetwork/1408.0.4 Darwin/22.5.0",
-            "X-Mme-Client-Info": "<MacBookPro18,3> <Mac OS X;13.4.1;22F8>"
-            " <com.apple.AOSKit/282 (com.apple.accountsd/113)>",
+            "User-Agent": self._anisette.user_agent.replace(
+                "akd/1.0", "com.apple.iCloudHelper/282", 1
+            ),
+            "X-Mme-Client-Info": self._anisette.get_client_info(
+                "com.apple.AOSKit/282 (com.apple.accountsd/113)",
+            ),
         }
-        headers.update(await self.get_anisette_headers())
+        headers.update(ani_headers)
 
         resp = await self._http.post(
             self._ENDPOINT_LOGIN_MOBILEME,
@@ -962,15 +985,24 @@ class AsyncAppleAccount(BaseAppleAccount):
         return r.text()
 
     async def _gsa_request(self, parameters: dict[str, Any]) -> dict[str, Any]:
+        cpd = await self._anisette.get_cpd(
+            self._uid,
+            self._devid,
+        )
+        raw_lu = cpd.get("X-Apple-I-MD-LU")
+        if isinstance(raw_lu, str) and raw_lu:
+            with contextlib.suppress(UnicodeDecodeError, ValueError):
+                self._uid = base64.b64decode(raw_lu, validate=True).decode()
+        raw_devid = cpd.get("X-Mme-Device-Id")
+        if isinstance(raw_devid, str) and raw_devid:
+            self._devid = raw_devid.lower()
+
         body = {
             "Header": {
                 "Version": "1.0.1",
             },
             "Request": {
-                "cpd": await self._anisette.get_cpd(
-                    self._uid,
-                    self._devid,
-                ),
+                "cpd": cpd,
                 **parameters,
             },
         }
@@ -978,7 +1010,7 @@ class AsyncAppleAccount(BaseAppleAccount):
         headers = {
             "Content-Type": "text/x-xml-plist",
             "Accept": "*/*",
-            "User-Agent": "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0",
+            "User-Agent": self._anisette.user_agent,
             "X-MMe-Client-Info": self._anisette.client,
         }
 
