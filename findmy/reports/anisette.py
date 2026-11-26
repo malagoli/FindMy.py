@@ -180,7 +180,9 @@ class BaseAnisetteProvider(util.abc.Closable, util.abc.Serializable, ABC):
         }
 
         if with_client_info:
-            headers["X-Mme-Client-Info"] = self.client
+            headers["X-Mme-Client-Info"] = self.get_client_info(
+                "com.apple.AOSKit/282 (com.apple.dt.Xcode/3594.4.19)",
+            )
             headers["X-Apple-App-Info"] = "com.apple.gs.xcode.auth"
             headers["X-Xcode-Version"] = "11.2 (11B41)"
 
@@ -349,7 +351,16 @@ class RemoteAnisetteProvider(BaseAnisetteProvider, util.abc.Serializable[RemoteA
 
             r = await self._http.get(self._server_url, auto_retry=True)
             self._anisette_data = r.json()
-            self._anisette_data_expires_at = time.time() + self._ANISETTE_DATA_VALID_FOR
+            now = time.time()
+            # CoreADI OTPs rotate on Unix epoch multiples of 30 seconds; align expiry so we
+            # never reuse an OTP from a previous 30-second window across GSA login steps.
+            window_end = (
+                int(now) // self._ANISETTE_DATA_VALID_FOR + 1
+            ) * self._ANISETTE_DATA_VALID_FOR
+            self._anisette_data_expires_at = min(
+                now + self._ANISETTE_DATA_VALID_FOR,
+                float(window_end),
+            )
 
         headers = await super().get_headers(user_id, device_id, serial, with_client_info)
         if (local_user := self._get_header("X-Apple-I-MD-LU")) is not None:
