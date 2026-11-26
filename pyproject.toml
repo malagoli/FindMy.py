@@ -1,6 +1,6 @@
 [project]
 name = "FindMy"
-version = "0.10.2.post1"
+version = "0.10.2.post2"
 description = "Query the location of your FindMy devices with Python!"
 readme = "README.md"
 authors = [{ name = "Mike Almeloo", email = "git@mikealmel.ooo" }]
@@ -85,8 +85,8 @@ ignore = [
     "PLC0415", # import not on top of file
 ]
 
-[tool.setuptools]
-packages = ["findmy"]
+[tool.setuptools.packages.find]
+include = ["findmy*"]
 
 [build-system]
 requires = ["setuptools", "setuptools-scm"]
